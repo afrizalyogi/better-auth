@@ -1806,6 +1806,379 @@ describe("oauth token - refresh_token", async () => {
 			}
 		});
 	});
+
+	/**
+	 * Independent reads of the refresh grant run together, and errors keep
+	 * their order.
+	 *
+	 * @see https://github.com/better-auth/better-auth/issues/12168
+	 */
+	describe("parallel reads", () => {
+		const overlapTimeoutMs = 500;
+
+		async function refresh(
+			refreshToken: string,
+			params?: { resource?: string; clientSecret?: string },
+		) {
+			if (!oauthClient?.client_id || !oauthClient?.client_secret) {
+				throw Error("beforeAll not run properly");
+			}
+			const { body, headers } = await refreshAccessTokenRequest({
+				refreshToken,
+				options: {
+					clientId: oauthClient.client_id,
+					clientSecret: params?.clientSecret ?? oauthClient.client_secret,
+					redirectURI: redirectUri,
+				},
+				resource: params?.resource,
+			});
+			return client.$fetch<{
+				access_token?: string;
+				refresh_token?: string;
+			}>("/oauth2/token", {
+				method: "POST",
+				body,
+				headers,
+			});
+		}
+
+		/** Resolves `true` once `started` resolves, or `false` after a timeout. */
+		function startsWhilePending(started: Promise<void>) {
+			return Promise.race([
+				started.then(() => true),
+				new Promise<boolean>((resolve) =>
+					setTimeout(() => resolve(false), overlapTimeoutMs),
+				),
+			]);
+		}
+
+		it("looks up the refresh token while the client is being read", async () => {
+			const tokens = await authorizeForRefreshToken([
+				"openid",
+				"offline_access",
+			]);
+			const context = await authorizationServer.$context;
+			const originalFindOne = context.adapter.findOne.bind(context.adapter);
+			let markRefreshLookupStarted = () => {};
+			const refreshLookupStarted = new Promise<void>((resolve) => {
+				markRefreshLookupStarted = resolve;
+			});
+			let overlapped: boolean | undefined;
+			const findOne = vi
+				.spyOn(context.adapter, "findOne")
+				.mockImplementation(async (...args) => {
+					const [params] = args;
+					if (params.model === "oauthRefreshToken") {
+						markRefreshLookupStarted();
+					}
+					if (params.model === "oauthClient" && overlapped === undefined) {
+						overlapped = await startsWhilePending(refreshLookupStarted);
+					}
+					return originalFindOne(...args);
+				});
+
+			try {
+				const refreshed = await refresh(tokens!.refresh_token!);
+				expect(refreshed.error).toBeNull();
+				expect(refreshed.data?.refresh_token).toBeDefined();
+				expect(overlapped).toBe(true);
+			} finally {
+				findOne.mockRestore();
+			}
+		});
+
+		it("resolves the resource policy while the user is being read", async () => {
+			const tokens = await authorizeForRefreshToken([
+				"openid",
+				"offline_access",
+			]);
+			const context = await authorizationServer.$context;
+			const originalFindOne = context.adapter.findOne.bind(context.adapter);
+			const originalFindUserById = context.internalAdapter.findUserById.bind(
+				context.internalAdapter,
+			);
+			let markResourceLookupStarted = () => {};
+			const resourceLookupStarted = new Promise<void>((resolve) => {
+				markResourceLookupStarted = resolve;
+			});
+			let overlapped: boolean | undefined;
+			const findOne = vi
+				.spyOn(context.adapter, "findOne")
+				.mockImplementation(async (...args) => {
+					const [params] = args;
+					if (params.model === "oauthResource") {
+						markResourceLookupStarted();
+					}
+					return originalFindOne(...args);
+				});
+			const findUserById = vi
+				.spyOn(context.internalAdapter, "findUserById")
+				.mockImplementation(async (userId) => {
+					if (overlapped === undefined) {
+						overlapped = await startsWhilePending(resourceLookupStarted);
+					}
+					return originalFindUserById(userId);
+				});
+
+			try {
+				const refreshed = await refresh(tokens!.refresh_token!, {
+					resource: validResource,
+				});
+				expect(refreshed.error).toBeNull();
+				expect(refreshed.data?.access_token).toBeDefined();
+				expect(overlapped).toBe(true);
+			} finally {
+				findOne.mockRestore();
+				findUserById.mockRestore();
+			}
+		});
+
+		it("still returns invalid_client before a failed refresh token lookup", async () => {
+			const context = await authorizationServer.$context;
+			const originalFindOne = context.adapter.findOne.bind(context.adapter);
+			const findOne = vi
+				.spyOn(context.adapter, "findOne")
+				.mockImplementation(async (...args) => {
+					const [params] = args;
+					if (params.model === "oauthRefreshToken") {
+						throw new Error("refresh token store unavailable");
+					}
+					return originalFindOne(...args);
+				});
+
+			try {
+				const response = await refresh("unknown-refresh-token", {
+					clientSecret: "wrong-secret",
+				});
+				expect(response.error).toMatchObject({ error: "invalid_client" });
+			} finally {
+				findOne.mockRestore();
+			}
+		});
+
+		it("still returns the missing user error before a resource policy error", async () => {
+			const tokens = await authorizeForRefreshToken([
+				"openid",
+				"offline_access",
+			]);
+			const context = await authorizationServer.$context;
+			const originalFindOne = context.adapter.findOne.bind(context.adapter);
+			const findOne = vi
+				.spyOn(context.adapter, "findOne")
+				.mockImplementation(async (...args) => {
+					const [params] = args;
+					if (params.model === "oauthResource") {
+						throw new Error("resource store unavailable");
+					}
+					return originalFindOne(...args);
+				});
+			const findUserById = vi
+				.spyOn(context.internalAdapter, "findUserById")
+				.mockResolvedValue(null);
+
+			try {
+				const response = await refresh(tokens!.refresh_token!, {
+					resource: validResource,
+				});
+				expect(response.error).toMatchObject({
+					error: "invalid_request",
+					error_description: "user not found",
+				});
+			} finally {
+				findOne.mockRestore();
+				findUserById.mockRestore();
+			}
+		});
+	});
+});
+
+/**
+ * @see https://github.com/better-auth/better-auth/issues/12168
+ */
+describe("oauth token - onRefreshTokenReuse", async () => {
+	const authServerBaseUrl = "http://localhost:3000";
+	const rpBaseUrl = "http://localhost:5000";
+	type ReuseHook = NonNullable<OAuthOptions<Scope[]>["onRefreshTokenReuse"]>;
+	const reuseCalls: Parameters<ReuseHook>[0][] = [];
+	let reuseHook: ReuseHook = () => false;
+	const {
+		auth: authorizationServer,
+		signInWithTestUser,
+		customFetchImpl,
+	} = await getTestInstance({
+		baseURL: authServerBaseUrl,
+		plugins: [
+			jwt({
+				jwt: {
+					issuer: authServerBaseUrl,
+				},
+			}),
+			oauthProvider({
+				loginPage: "/login",
+				consentPage: "/consent",
+				onRefreshTokenReuse(context) {
+					reuseCalls.push(context);
+					return reuseHook(context);
+				},
+			}),
+		],
+	});
+
+	const { headers } = await signInWithTestUser();
+	const client = createAuthClient({
+		plugins: [oauthProviderClient()],
+		baseURL: authServerBaseUrl,
+		fetchOptions: {
+			customFetchImpl,
+			headers,
+		},
+	});
+
+	let oauthClient: OAuthClient | null;
+	const providerId = "test";
+	const redirectUri = `${rpBaseUrl}/api/auth/oauth2/callback/${providerId}`;
+
+	beforeAll(async () => {
+		oauthClient = await authorizationServer.api.adminCreateOAuthClient({
+			headers,
+			body: {
+				token_endpoint_auth_method: "client_secret_post",
+				grant_types: ["authorization_code", "refresh_token"],
+				redirect_uris: [redirectUri],
+				application_type: "native",
+				skip_consent: true,
+			},
+		});
+		expect(oauthClient?.client_secret).toBeDefined();
+	});
+
+	async function authorizeForRefreshToken() {
+		if (!oauthClient?.client_id || !oauthClient?.client_secret) {
+			throw Error("beforeAll not run properly");
+		}
+		const codeVerifier = generateRandomString(32);
+		const authUrl = await createAuthorizationURL({
+			id: providerId,
+			options: {
+				clientId: oauthClient.client_id,
+				clientSecret: oauthClient.client_secret,
+				redirectURI: redirectUri,
+			},
+			redirectURI: "",
+			authorizationEndpoint: `${authServerBaseUrl}/api/auth/oauth2/authorize`,
+			state: "123",
+			scopes: ["openid", "offline_access"],
+			codeVerifier,
+		});
+
+		let callbackRedirectUrl = "";
+		await client.$fetch(authUrl.toString(), {
+			onError(context) {
+				callbackRedirectUrl = context.response.headers.get("Location") || "";
+			},
+		});
+		const callbackUrl = new URL(callbackRedirectUrl);
+		const { body, headers } = await authorizationCodeRequest({
+			code: callbackUrl.searchParams.get("code")!,
+			codeVerifier,
+			redirectURI: redirectUri,
+			options: {
+				clientId: oauthClient.client_id,
+				clientSecret: oauthClient.client_secret,
+				redirectURI: redirectUri,
+			},
+		});
+
+		const tokens = await client.$fetch<OAuthTokenResponse>("/oauth2/token", {
+			method: "POST",
+			body,
+			headers,
+		});
+		expect(tokens.data?.refresh_token).toBeDefined();
+		return tokens.data!;
+	}
+
+	async function refresh(refreshToken: string) {
+		if (!oauthClient?.client_id || !oauthClient?.client_secret) {
+			throw Error("beforeAll not run properly");
+		}
+		const { body, headers } = await refreshAccessTokenRequest({
+			refreshToken,
+			options: {
+				clientId: oauthClient.client_id,
+				clientSecret: oauthClient.client_secret,
+				redirectURI: redirectUri,
+			},
+		});
+		return client.$fetch<OAuthTokenResponse>("/oauth2/token", {
+			method: "POST",
+			body,
+			headers,
+		});
+	}
+
+	/** Rotates once, then presents the rotated parent token again. */
+	async function reuseRotatedToken() {
+		reuseCalls.length = 0;
+		const tokens = await authorizeForRefreshToken();
+		const rotated = await refresh(tokens.refresh_token!);
+		expect(rotated.error).toBeNull();
+		expect(reuseCalls).toHaveLength(0);
+
+		const reused = await refresh(tokens.refresh_token!);
+		return { reused, child: rotated.data!.refresh_token! };
+	}
+
+	it("skips family invalidation when the hook handles the reuse", async () => {
+		reuseHook = () => true;
+		const { reused, child } = await reuseRotatedToken();
+
+		expect(reused.error).toMatchObject({ error: "invalid_grant" });
+		expect(reuseCalls).toHaveLength(1);
+		expect(reuseCalls[0]?.client.clientId).toBe(oauthClient?.client_id);
+		expect(reuseCalls[0]?.refreshToken.revoked).toBeTruthy();
+		expect(reuseCalls[0]?.refreshToken.clientId).toBe(oauthClient?.client_id);
+
+		const next = await refresh(child);
+		expect(next.error).toBeNull();
+		expect(next.data?.refresh_token).toBeDefined();
+	});
+
+	it("invalidates the family when the hook returns false", async () => {
+		reuseHook = () => false;
+		const { reused, child } = await reuseRotatedToken();
+
+		expect(reused.error).toMatchObject({ error: "invalid_grant" });
+		expect(reuseCalls).toHaveLength(1);
+		expect((await refresh(child)).error).toMatchObject({
+			error: "invalid_grant",
+		});
+	});
+
+	it("invalidates the family when the hook throws", async () => {
+		reuseHook = () => {
+			throw new Error("hook failed");
+		};
+		const context = await authorizationServer.$context;
+		const loggerError = vi
+			.spyOn(context.logger, "error")
+			.mockImplementation(() => undefined);
+
+		try {
+			const { reused, child } = await reuseRotatedToken();
+
+			expect(reused.error).toMatchObject({ error: "invalid_grant" });
+			expect(loggerError).toHaveBeenCalledWith(
+				"onRefreshTokenReuse failed",
+				expect.any(Error),
+			);
+			expect((await refresh(child)).error).toMatchObject({
+				error: "invalid_grant",
+			});
+		} finally {
+			loggerError.mockRestore();
+		}
+	});
 });
 
 describe("oauth token - refresh_token reuse interval", async () => {

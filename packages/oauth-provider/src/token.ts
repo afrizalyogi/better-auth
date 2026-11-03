@@ -708,6 +708,11 @@ async function createRefreshToken(
 type CreateUserTokensParams = OAuthTokenIssueParams & {
 	grantType: GrantType;
 	authorizationCodeId?: string;
+	/**
+	 * Resource policy resolved ahead of time for `client`, `scopes` and
+	 * `resources`, so a grant can read it in parallel with other lookups.
+	 */
+	resourcePolicy?: ResolvedResourcePolicy;
 };
 
 interface ResourceGrantIssuance {
@@ -733,13 +738,20 @@ async function resolveResourceGrantIssuance(
 		refreshToken?: OAuthRefreshToken<Scope[]> & { id: string };
 		iat: number;
 		scopeExpiresAtSeconds: number;
+		/**
+		 * Policy already resolved by the caller for the same `clientId`,
+		 * `requestedScopes` and `resources`.
+		 */
+		resourcePolicy?: ResolvedResourcePolicy;
 	},
 ): Promise<ResourceGrantIssuance> {
-	const resourcePolicy = await resolveResourcePolicy(ctx, opts, {
-		resource: params.resources,
-		clientId: params.clientId,
-		requestedScopes: params.requestedScopes,
-	});
+	const resourcePolicy =
+		params.resourcePolicy ??
+		(await resolveResourcePolicy(ctx, opts, {
+			resource: params.resources,
+			clientId: params.clientId,
+			requestedScopes: params.requestedScopes,
+		}));
 	const resourceExpiresAtSeconds =
 		resourcePolicy.accessTokenTtl !== null
 			? params.iat + resourcePolicy.accessTokenTtl
@@ -1137,6 +1149,7 @@ async function createUserTokens(
 		refreshToken: params.refreshToken,
 		iat,
 		scopeExpiresAtSeconds: scopeExp,
+		resourcePolicy: params.resourcePolicy,
 	});
 	const audienceClaim = grantIssuance.audienceClaim;
 	const effectiveScopes = grantIssuance.effectiveScopes;
@@ -1827,37 +1840,31 @@ async function handleRefreshTokenGrant(
 		});
 	}
 
-	/** Verify Client (RFC 6749 §5.2: an unknown or unauthenticated client is
-	 * `invalid_client`, so resolve it before the refresh token lookup can
-	 * report `invalid_grant`). */
-	const client = await validateClientCredentials(
-		ctx,
-		opts,
-		client_id,
-		client_secret, // Optional for refresh_grant but required on confidential clients
-		undefined,
-		preVerified,
-		"refresh_token",
-		authMethod,
-	);
-
-	const decodedRefresh = await decodeRefreshToken(opts, refresh_token);
-
-	const refreshToken = await ctx.context.adapter.findOne<
-		OAuthRefreshToken<Scope[]> & { id: string }
-	>({
-		model: "oauthRefreshToken",
-		where: [
-			{
-				field: "token",
-				value: await getStoredToken(
-					opts.storeTokens,
-					decodedRefresh.token,
-					"refresh_token",
-				),
-			},
-		],
-	});
+	// The client and the refresh token are independent reads, so look them up
+	// together. RFC 6749 §5.2: an unknown or unauthenticated client is
+	// `invalid_client`, so the client's error is still raised before anything
+	// the refresh token lookup reports.
+	const [clientResult, refreshTokenResult] = await Promise.allSettled([
+		validateClientCredentials(
+			ctx,
+			opts,
+			client_id,
+			client_secret, // Optional for refresh_grant but required on confidential clients
+			undefined,
+			preVerified,
+			"refresh_token",
+			authMethod,
+		),
+		findRefreshToken(ctx, opts, refresh_token),
+	]);
+	if (clientResult.status === "rejected") {
+		throw clientResult.reason;
+	}
+	if (refreshTokenResult.status === "rejected") {
+		throw refreshTokenResult.reason;
+	}
+	const client = clientResult.value;
+	const refreshToken = refreshTokenResult.value;
 
 	// Check refresh
 	if (!refreshToken) {
@@ -1932,21 +1939,41 @@ async function handleRefreshTokenGrant(
 				error: "invalid_grant",
 			});
 		}
-		await invalidateRefreshFamily(ctx, client_id, refreshToken.userId);
+		if (!(await handleRefreshTokenReuse(ctx, opts, client, refreshToken))) {
+			await invalidateRefreshFamily(ctx, client_id, refreshToken.userId);
+		}
 		throw new APIError("BAD_REQUEST", {
 			error_description: "invalid refresh token",
 			error: "invalid_grant",
 		});
 	}
 
-	const user = await ctx.context.internalAdapter.findUserById(
-		refreshToken.userId,
-	);
+	const issueScopes = requestedScopes ?? scopes;
+	const issueResources = resources ?? refreshToken.resources;
+
+	// The resource policy needs only the client, scopes and resources, so
+	// resolve it while the user is read. The user's error is still raised
+	// before any `invalid_target` or `invalid_scope` from the policy.
+	const [userResult, resourcePolicyResult] = await Promise.allSettled([
+		ctx.context.internalAdapter.findUserById(refreshToken.userId),
+		resolveResourcePolicy(ctx, opts, {
+			resource: issueResources,
+			clientId: client.clientId,
+			requestedScopes: issueScopes,
+		}),
+	]);
+	if (userResult.status === "rejected") {
+		throw userResult.reason;
+	}
+	const user = userResult.value;
 	if (!user) {
 		throw new APIError("BAD_REQUEST", {
 			error_description: "user not found",
 			error: "invalid_request",
 		});
+	}
+	if (resourcePolicyResult.status === "rejected") {
+		throw resourcePolicyResult.reason;
 	}
 
 	const authTime =
@@ -1957,15 +1984,66 @@ async function handleRefreshTokenGrant(
 	// Generate new tokens
 	return createUserTokens(ctx, opts, {
 		client,
-		scopes: requestedScopes ?? scopes,
+		scopes: issueScopes,
 		user,
 		grantType: "refresh_token",
 		referenceId: refreshToken.referenceId,
 		authorizationCodeId: refreshToken.authorizationCodeId,
 		sessionId: refreshToken.sessionId,
 		refreshToken,
-		resources: resources ?? refreshToken.resources,
+		resources: issueResources,
 		authTime,
 		requestedUserInfoClaims: refreshToken.requestedUserInfoClaims,
+		resourcePolicy: resourcePolicyResult.value,
+	});
+}
+
+/**
+ * Runs {@link OAuthOptions.onRefreshTokenReuse}. Returns `true` only when the
+ * hook reports that it handled the reuse; a throwing hook falls back to
+ * family invalidation.
+ */
+async function handleRefreshTokenReuse(
+	ctx: GenericEndpointContext,
+	opts: OAuthOptions<Scope[]>,
+	client: SchemaClient<Scope[]>,
+	refreshToken: OAuthRefreshToken<Scope[]> & { id: string },
+) {
+	if (!opts.onRefreshTokenReuse) {
+		return false;
+	}
+	try {
+		return (
+			(await opts.onRefreshTokenReuse({ ctx, client, refreshToken })) === true
+		);
+	} catch (error) {
+		ctx.context.logger.error("onRefreshTokenReuse failed", error);
+		return false;
+	}
+}
+
+/**
+ * Decodes a presented refresh token and loads its stored row.
+ */
+async function findRefreshToken(
+	ctx: GenericEndpointContext,
+	opts: OAuthOptions<Scope[]>,
+	refreshToken: string,
+) {
+	const decodedRefresh = await decodeRefreshToken(opts, refreshToken);
+	return ctx.context.adapter.findOne<
+		OAuthRefreshToken<Scope[]> & { id: string }
+	>({
+		model: "oauthRefreshToken",
+		where: [
+			{
+				field: "token",
+				value: await getStoredToken(
+					opts.storeTokens,
+					decodedRefresh.token,
+					"refresh_token",
+				),
+			},
+		],
 	});
 }

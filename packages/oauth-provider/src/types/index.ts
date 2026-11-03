@@ -722,6 +722,38 @@ export interface OAuthOptions<
 	 */
 	refreshTokenReuseInterval?: number;
 	/**
+	 * Called when a rotated or revoked refresh token is presented to the
+	 * `refresh_token` grant outside {@link refreshTokenReuseInterval}, just
+	 * before the refresh-token family for the token's client and user is
+	 * invalidated.
+	 *
+	 * Return `true` when the hook handled the reuse itself (for example, by
+	 * revoking only the session the reused token was bound to). Family
+	 * invalidation is then skipped. Return `false` to keep the default family
+	 * invalidation. Either way the grant answers `invalid_grant`.
+	 *
+	 * If the hook throws, the error is logged and the family is invalidated.
+	 *
+	 * @example
+	 * ```ts
+	 * onRefreshTokenReuse: async ({ ctx, refreshToken }) => {
+	 * 	if (!refreshToken.sessionId) return false;
+	 * 	await ctx.context.adapter.deleteMany({
+	 * 		model: "oauthRefreshToken",
+	 * 		where: [{ field: "sessionId", value: refreshToken.sessionId }],
+	 * 	});
+	 * 	return true;
+	 * }
+	 * ```
+	 */
+	onRefreshTokenReuse?: (context: {
+		ctx: GenericEndpointContext;
+		/** The authenticated client presenting the reused token. */
+		client: SchemaClient<Scope[]>;
+		/** The stored row of the reused refresh token. */
+		refreshToken: OAuthRefreshToken<Scope[]> & { id: string };
+	}) => Awaitable<boolean>;
+	/**
 	 * The amount of time in seconds that the authorization code is valid for.
 	 *
 	 * @default 600 (10 minutes) - Recommended by the OIDC spec
